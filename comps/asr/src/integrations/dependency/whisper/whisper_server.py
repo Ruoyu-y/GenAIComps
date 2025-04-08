@@ -2,30 +2,101 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import asyncio
 import base64
+import hashlib
 import os
+import threading
+import time
 import uuid
 from typing import List
 
 import uvicorn
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket
 from fastapi.responses import Response
 from pydub import AudioSegment
 from starlette.middleware.cors import CORSMiddleware
 from whisper_model import WhisperModel
+from faster_whisper_model import FasterWhisperModel
 
 from comps import CustomLogger
-from comps.cores.proto.api_protocol import AudioTranscriptionResponse
+from comps.cores.proto.api_protocol import AudioTranscriptionResponse, RealtimeTranscriptionSession
 
 logger = CustomLogger("whisper")
 logflag = os.getenv("LOGFLAG", False)
 
+# audio configuration constants
+SAMPLE_RATE = 16000  # Hz
+BYTES_PER_SAMPLE = 2  # 16-bit audio
+DEFAULT_CHUNK_DURATION_MS = 1000  # default chunk size is 1 second
+DEFAULT_FRAMES_PER_CHUNK = SAMPLE_RATE  # 16000 frames per second
+DEFAULT_DATA_TIMEOUT_MS = 1500  # set 1500ms for timeout
+
 app = FastAPI()
 asr = None
+streaming_asr = None
+streaming_asr_ready = threading.Event()
+
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
+
+
+def generate_session_id(curr_time):
+    """
+    generate session id with prefix 'sess_' and current time hash
+
+    Returns:
+        session id
+    """
+    if curr_time is None:
+        curr_time = time.time()
+    # change timestamp to 'utf-8' encoded bytes
+    time_str = f"{curr_time}"
+    time_bytes = time_str.encode('utf-8')
+
+    # calculate MD5 hash
+    md5_hash = hashlib.md5(time_bytes).hexdigest()
+
+    # return session id
+    return f"sess_{md5_hash}"
+
+
+def is_buffer_ready(buffer: bytes, chunk_size: int) -> bool:
+    """check if the buffer is ready for a complete chunk"""
+    return len(buffer) >= chunk_size
+
+
+def init_streaming_whisper(model_size: str, device: str, compute_type: str, language: str):
+    """init streaming whisper service in a thread"""
+    global streaming_asr
+    if device == "cpu":
+        """initialize the faster-whisper based streaming whisper model in a separate thread"""
+        try:
+            streaming_asr = FasterWhisperModel(
+                model_size_or_path=model_size,
+                device=device,
+                compute_type=compute_type
+            )
+            streaming_asr_ready.set()
+            logger.info("Faster Whisper model initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Faster Whisper model: {e}")
+            streaming_asr_ready.set()  # set the event even if it fails to avoid permanent waiting
+    else:
+        """initialize the streaming whisper model on other platforms in a separate thread"""
+        try:
+            streaming_asr = WhisperModel(
+                model_name_or_path=model_size,
+                language=language,
+                device=device
+            )
+            streaming_asr_ready.set()
+            logger.info("Streaming Whisper initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize streaming Whisper model: {e}")
+            streaming_asr_ready.set()
 
 
 @app.get("/health")
@@ -103,11 +174,184 @@ async def audio_transcriptions(
     return AudioTranscriptionResponse(text=asr_result)
 
 
+@app.post("/v1/realtime/transcription_sessions")
+async def create_realtime_transcription_session(
+    input_audio_format: str = Form("pcm16"),
+    input_audio_noise_reduction: dict = Form(None),
+    input_audio_transcription: dict = Form("json"),
+    modalities: List = Form(None),
+    turn_detection: dict = Form(None),
+    include: str = Form(None)
+):
+    logger.info("Creating realtime transcription session.")
+    curr_time = time.time()
+    session_id = generate_session_id(curr_time)
+    expire_time = curr_time + 300  # set the expire time as 5 mins
+    if len(modalities) != 0:
+        if modalities[0] != "text":
+            logger.info("Do not support modalities other than text for now.")
+            modalities = "text"
+    else:
+        modalities = ["text"]
+
+    # Initialize configuration dictionary
+    valid_config = {
+        "model": streaming_asr.model,
+        "language": streaming_asr.language,
+        "prompt": ""
+    }
+
+    if isinstance(input_audio_transcription, dict):
+        # Check for unknown keys
+        unknown_keys = [
+            k for k in input_audio_transcription.keys() if k not in valid_config]
+        if unknown_keys:
+            logger.warning(
+                f"Found unknown configuration keys: {unknown_keys}, these will be ignored")
+
+        # Handle model configuration
+        if "model" in input_audio_transcription:
+            model = input_audio_transcription["model"]
+            if model != valid_config["model"]:
+                logger.warning(
+                    f"Unmatched model: {model}. Now is using model {streaming_asr.model}")
+
+        # Handle language configuration
+        if "language" in input_audio_transcription and valid_config["language"] != input_audio_transcription["language"]:
+            logger.warning(
+                f"Unmatched language setting. Now is using language {streaming_asr.language}")
+
+    # Check if noise reduction is requested
+    if input_audio_noise_reduction:
+        logger.warning("Audio noise reduction is not supported at this time")
+
+    if turn_detection:
+        logger.warning("Audio turn detection is only supported in cpu mode")
+
+    if include:
+        logger.warning("Audio include setting is not supported at this time")
+
+    return RealtimeTranscriptionSession(session_id=session_id, expires_at=expire_time,
+                                        input_audio_format=input_audio_format, input_audio_transcription=valid_config,
+                                        modalities=modalities, turn_detection=None)
+
+
+@app.websocket("/v1/realtime")
+async def audio_transcriptions_streaming(websocket: WebSocket, intent: str = "transcription"):
+    """
+    This endpoint is used to stream the transcription of the audio input.
+    Args:
+        websocket: WebSocket
+        intent: String, default is "transcription"
+    """
+    if intent != "transcription":
+        logger.warning(
+            "Unsupported function. Currently only support the 'transcription' intent.")
+        await websocket.close()
+        return
+
+    await websocket.accept()
+
+    chunk_size = int((DEFAULT_CHUNK_DURATION_MS *
+                     DEFAULT_FRAMES_PER_CHUNK) / 1000) * BYTES_PER_SAMPLE
+    logger.info(f"Chunk size: {chunk_size}")
+
+    # wait for the faster-whisper model to be initialized
+    if not streaming_asr_ready.wait(timeout=10):
+        await websocket.send_json({
+            "event_id": "event_0",
+            "type": "error",
+            "error": {
+                "type": "initialization_timeout",
+                "code": "initialization_timeout",
+                "message": "The streaming asr failed to initialize.",
+                "param": None,
+                "event_id": "event_0"
+            }
+        })
+        return
+
+    if streaming_asr is None:
+        await websocket.send_json({
+            "event_id": "event_0",
+            "type": "error",
+            "error": {
+                "type": "initialization_failure",
+                "code": "initialization_failure",
+                "message": "The streaming asr model failed to initialize.",
+                "param": None,
+                "event_id": "event_0"
+            }
+        })
+        return
+
+    try:
+        # initialize audio buffer
+        audio_buffer = bytearray()
+        idx_list = {}
+        item_id = 0
+
+        while True:
+            try:
+                # receive message with timeout
+                try:
+                    message = await asyncio.wait_for(
+                        websocket.receive_json(),
+                        timeout=DEFAULT_DATA_TIMEOUT_MS / 1000
+                    )
+                except asyncio.TimeoutError:
+                    if len(audio_buffer) > 0:
+                        logger.info(
+                            f"Data receive timeout ({DEFAULT_DATA_TIMEOUT_MS}ms), processing final {len(audio_buffer)} bytes of audio data")
+                        await streaming_asr.audio2text_streaming(websocket=websocket, audio_data=bytes(audio_buffer), item_id=item_id+1, is_final=True)
+                    break
+
+                # process the audio data
+                if message.get("type") == "input_audio_buffer.append":
+                    # check if event_id exists in the index map
+                    event_id = message.get("event_id")
+                    if event_id in idx_list:
+                        item_id = idx_list[event_id] + 1
+                    else:
+                        idx_list[event_id] = 0
+                        item_id = 0
+
+                    # fetch audio data
+                    audio_data = base64.b64decode(message.get("audio", ""))
+                    audio_buffer.extend(audio_data)
+
+                    # process complete chunks
+                    while len(audio_buffer) >= chunk_size:
+                        await streaming_asr.audio2text_streaming(websocket=websocket, audio_data=bytes(audio_buffer[:chunk_size]), item_id=item_id)
+                        audio_buffer = audio_buffer[chunk_size:]
+
+            except WebSocketDisconnect:
+                logger.info("WebSocket connection closed unexpectedly")
+                break
+            except Exception as e:
+                logger.error(f"Error in WebSocket connection: {e}")
+                await websocket.send_json({
+                    "status": "error",
+                    "error": str(e)
+                })
+                break
+
+    except Exception as e:
+        logger.error(f"Error in audio streaming: {e}")
+        await websocket.send_json({
+            "status": "error",
+            "error": str(e)
+        })
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7066)
-    parser.add_argument("--model_name_or_path", type=str, default="openai/whisper-small")
+    parser.add_argument("--model_name_or_path", type=str,
+                        default="openai/whisper-small")
+    parser.add_argument("--streaming_model_name_or_path",
+                        type=str, default="openai/whisper-tiny")
     parser.add_argument("--language", type=str, default="english")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--return_timestamps", type=str, default=True)
@@ -119,5 +363,13 @@ if __name__ == "__main__":
         device=args.device,
         return_timestamps=args.return_timestamps,
     )
+
+    streaming_whisper_thread = threading.Thread(
+        target=init_streaming_whisper,
+        args=(args.streaming_model_name_or_path,
+              args.device, args.compute_type, args.language),
+        daemon=True
+    )
+    streaming_whisper_thread.start()
 
     uvicorn.run(app, host=args.host, port=args.port)

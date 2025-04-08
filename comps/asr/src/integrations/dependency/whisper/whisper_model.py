@@ -3,12 +3,18 @@
 
 import os
 import time
+import uuid
 import urllib.request
+import wave
+from fastapi import WebSocket, Form
 
 import numpy as np
 import torch
 from datasets import Audio, Dataset
 from pydub import AudioSegment
+
+BYTES_PER_SAMPLE = 2  # 16-bit audio
+SAMPLE_RATE = 16000  # Hz
 
 
 class WhisperModel:
@@ -30,10 +36,29 @@ class WhisperModel:
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
         self.device = device
-        self.asr_model_name_or_path = os.environ.get("ASR_MODEL_PATH", model_name_or_path)
+        self.asr_model_name_or_path = os.environ.get(
+            "ASR_MODEL_PATH", model_name_or_path)
         print("Downloading model: {}".format(self.asr_model_name_or_path))
-        self.model = WhisperForConditionalGeneration.from_pretrained(self.asr_model_name_or_path).to(self.device)
-        self.processor = WhisperProcessor.from_pretrained(self.asr_model_name_or_path)
+
+        if device == "intel-gpu":
+            # intel gpu mode
+            from ipex_llm.transformers import AutoModelForSpeechSeq2Seq
+            from transformers import WhisperProcessor
+            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                self.asr_model_name_or_path,
+                load_in_4bit=True,
+                optimize_model=False,
+                use_cache=True
+            )
+            self.model.to(self.device)
+            self.processor = WhisperProcessor.from_pretrained(
+                self.asr_model_name_or_path)
+        else:
+            # cpu mode
+            self.model = WhisperForConditionalGeneration.from_pretrained(
+                self.asr_model_name_or_path).to(self.device)
+            self.processor = WhisperProcessor.from_pretrained(
+                self.asr_model_name_or_path)
         self.model.eval()
 
         self.language = language
@@ -42,16 +67,19 @@ class WhisperModel:
 
         if device == "hpu":
             self._warmup_whisper_hpu_graph(
-                os.path.dirname(os.path.abspath(__file__)) + "/../../../../assets/ljspeech_30s_audio.wav"
+                os.path.dirname(os.path.abspath(__file__)) +
+                "/../../../../assets/ljspeech_30s_audio.wav"
             )
             self._warmup_whisper_hpu_graph(
-                os.path.dirname(os.path.abspath(__file__)) + "/../../../../assets/ljspeech_60s_audio.wav"
+                os.path.dirname(os.path.abspath(__file__)) +
+                "/../../../../assets/ljspeech_60s_audio.wav"
             )
 
     def _audiosegment_to_librosawav(self, audiosegment):
         # https://github.com/jiaaro/pydub/blob/master/API.markdown#audiosegmentget_array_of_samples
         # This way is faster than librosa.load or HuggingFace Dataset wrapper
-        channel_sounds = audiosegment.split_to_mono()[:1]  # only select the first channel
+        # only select the first channel
+        channel_sounds = audiosegment.split_to_mono()[:1]
         samples = [s.get_array_of_samples() for s in channel_sounds]
 
         fp_arr = np.array(samples).T.astype(np.float32)
@@ -126,7 +154,8 @@ class WhisperModel:
             waveform = self._audiosegment_to_librosawav(waveform)
         except Exception as e:
             print(f"[ASR] audiosegment to librosa wave fail: {e}")
-            audio_dataset = Dataset.from_dict({"audio": [audio_path]}).cast_column("audio", Audio(sampling_rate=16000))
+            audio_dataset = Dataset.from_dict({"audio": [audio_path]}).cast_column(
+                "audio", Audio(sampling_rate=16000))
             waveform = audio_dataset[0]["audio"]["array"]
 
         try:
@@ -177,13 +206,94 @@ class WhisperModel:
             return_timestamps=self.return_timestamps,
         )
         # pylint: disable=E1101
-        result = self.processor.tokenizer.batch_decode(predicted_ids, skip_special_tokens=True, normalize=True)[0]
+        result = self.processor.tokenizer.batch_decode(
+            predicted_ids, skip_special_tokens=True, normalize=True)[0]
         if self.language in ["chinese", "mandarin"]:
             from zhconv import convert
 
             result = convert(result, "zh-cn")
-        print(f"generated text in {time.time() - start} seconds, and the result is: {result}")
+        print(
+            f"generated text in {time.time() - start} seconds, and the result is: {result}")
         return result
+
+    async def audio2text_streaming(self,
+                                   websocket: WebSocket,
+                                   audio_data: bytes,
+                                   event_id: str,
+                                   item_id: int,
+                                   language: str = Form("en"),
+                                   is_final: bool = False):
+        """Convert streaming audio to text"""
+        if not audio_data:
+            return
+
+        transcription = ""
+
+        # generate a temporary file name
+        uid = str(uuid.uuid4())
+        temp_filename = f"{uid}.wav"
+
+        try:
+            # create a WAV file
+            with wave.open(temp_filename, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # single channel
+                wav_file.setsampwidth(BYTES_PER_SAMPLE)  # 16-bit
+                wav_file.setframerate(SAMPLE_RATE)
+                wav_file.writeframes(audio_data)
+            waveform = AudioSegment.from_file(
+                temp_filename).set_frame_rate(SAMPLE_RATE)
+            waveform = self._audiosegment_to_librosawav(waveform)
+        except Exception as e:
+            print(f"[ASR] audiosegment to librosa wave fail: {e}")
+            audio_dataset = Dataset.from_dict({"audio": [temp_filename]}).cast_column(
+                "audio", Audio(sampling_rate=SAMPLE_RATE))
+            waveform = audio_dataset[0]["audio"]["array"]
+
+        if self.device == "intel-gpu":
+            forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+                language=language, task="transcribe")
+            with torch.inference_mode():
+                input_features = self.processor(
+                    waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt").input_features.to('xpu')
+                predicted_ids = self.model.generate(
+                    input_features, forced_decoder_ids=forced_decoder_ids)
+                output_str = self.processor.batch_decode(
+                    predicted_ids, skip_special_tokens=True)
+                # change the output format to be compatible with the OpenAI API
+                if is_final:
+                    response = {
+                        "event_id": event_id,
+                        "type": "conversation.item.input_audio_transcription.completed",
+                        "item_id": "item_" + f"{item_id:03}",
+                        "content_index": 0,
+                        "transcript": transcription + output_str
+                    }
+                    transcription = ""
+                else:
+                    response = {
+                        "type": "conversation.item.input_audio_transcription.delta",
+                        "event_id": event_id,
+                        "item_id": "item_" + f"{item_id:03}",
+                        "content_index": 0,
+                        "delta": output_str
+                    }
+                    transcription += output_str
+
+                # if the output is in Chinese, convert it to simplified Chinese
+                if self.language in ["chinese", "mandarin"]:
+                    from zhconv import convert
+                    if "delta" in response:
+                        response["delta"] = convert(response["delta"], "zh-cn")
+                    else:
+                        response["transcript"] = convert(
+                            response["transcript"], "zh-cn")
+
+                # send the response through websocket
+                await websocket.send_json(response)
+
+        else:
+            raise ValueError(f"Unsupported device: {self.device}")
+        os.remove(temp_filename)
 
 
 if __name__ == "__main__":
