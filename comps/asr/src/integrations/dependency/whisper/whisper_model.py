@@ -40,25 +40,27 @@ class WhisperModel:
             "ASR_MODEL_PATH", model_name_or_path)
         print("Downloading model: {}".format(self.asr_model_name_or_path))
 
-        if device == "intel-gpu":
+        if device == "xpu":
             # intel gpu mode
             from ipex_llm.transformers import AutoModelForSpeechSeq2Seq
             from transformers import WhisperProcessor
             self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                self.asr_model_name_or_path,
+                model_name_or_path,
                 load_in_4bit=True,
                 optimize_model=False,
                 use_cache=True
             )
             self.model.to(self.device)
+            self.model.forced_decoder_ids = None
             self.processor = WhisperProcessor.from_pretrained(
-                self.asr_model_name_or_path)
+                model_name_or_path)
+            print("Whisper initialized on Intel GPU.")
         else:
             # cpu mode
             self.model = WhisperForConditionalGeneration.from_pretrained(
-                self.asr_model_name_or_path).to(self.device)
+                model_name_or_path).to(self.device)
             self.processor = WhisperProcessor.from_pretrained(
-                self.asr_model_name_or_path)
+                model_name_or_path)
         self.model.eval()
 
         self.language = language
@@ -221,7 +223,7 @@ class WhisperModel:
                                    audio_data: bytes,
                                    event_id: str,
                                    item_id: int,
-                                   language: str = Form("en"),
+                                   language: str = "en",
                                    is_final: bool = False):
         """Convert streaming audio to text"""
         if not audio_data:
@@ -240,26 +242,30 @@ class WhisperModel:
                 wav_file.setsampwidth(BYTES_PER_SAMPLE)  # 16-bit
                 wav_file.setframerate(SAMPLE_RATE)
                 wav_file.writeframes(audio_data)
-            waveform = AudioSegment.from_file(
-                temp_filename).set_frame_rate(SAMPLE_RATE)
-            waveform = self._audiosegment_to_librosawav(waveform)
         except Exception as e:
-            print(f"[ASR] audiosegment to librosa wave fail: {e}")
-            audio_dataset = Dataset.from_dict({"audio": [temp_filename]}).cast_column(
-                "audio", Audio(sampling_rate=SAMPLE_RATE))
-            waveform = audio_dataset[0]["audio"]["array"]
+            print(f"[ASR] Failed to save audiosegment to file: {e}")
+            return
 
-        if self.device == "intel-gpu":
-            forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-                language=language, task="transcribe")
+        ds = Dataset.from_dict({"audio": [temp_filename]}).cast_column("audio", Audio())
+
+        if self.device == "xpu":
             with torch.inference_mode():
-                input_features = self.processor(
-                    waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt").input_features.to('xpu')
-                predicted_ids = self.model.generate(
-                    input_features, forced_decoder_ids=forced_decoder_ids)
-                output_str = self.processor.batch_decode(
-                    predicted_ids, skip_special_tokens=True)
+                sample = ds[0]["audio"]
+
+                inputs = self.processor(sample["array"],
+                                   sampling_rate=sample["sampling_rate"],
+                                   return_attention_mask=True,
+                                   return_tensors="pt")
+                input_features = inputs.input_features.to('xpu')
+                attention_mask = inputs.attention_mask.to('xpu')
+                forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task="transcribe")
+                predicted_ids = self.model.generate(input_features,
+                                               forced_decoder_ids=forced_decoder_ids,
+                                               attention_mask=attention_mask)
+                output_str = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
+
                 # change the output format to be compatible with the OpenAI API
+                '''
                 if is_final:
                     response = {
                         "event_id": event_id,
@@ -270,14 +276,16 @@ class WhisperModel:
                     }
                     transcription = ""
                 else:
-                    response = {
-                        "type": "conversation.item.input_audio_transcription.delta",
-                        "event_id": event_id,
-                        "item_id": "item_" + f"{item_id:03}",
-                        "content_index": 0,
-                        "delta": output_str
-                    }
-                    transcription += output_str
+                '''
+                response = {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "event_id": event_id,
+                    "item_id": "item_" + f"{item_id:03}",
+                    "content_index": 0,
+                    "delta": output_str
+                }
+                # combine delta together
+                # transcription += output_str
 
                 # if the output is in Chinese, convert it to simplified Chinese
                 if self.language in ["chinese", "mandarin"]:

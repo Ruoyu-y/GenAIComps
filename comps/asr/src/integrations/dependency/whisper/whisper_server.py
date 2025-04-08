@@ -12,12 +12,12 @@ import uuid
 from typing import List
 
 import uvicorn
-from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket
+from fastapi import FastAPI, File, Form, Body, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from pydub import AudioSegment
 from starlette.middleware.cors import CORSMiddleware
 from whisper_model import WhisperModel
-from faster_whisper_model import FasterWhisperModel
+from faster_whisper_model import FasterWhisperModel, BYTES_PER_SAMPLE, SAMPLE_RATE
 
 from comps import CustomLogger
 from comps.cores.proto.api_protocol import AudioTranscriptionResponse, RealtimeTranscriptionSession
@@ -25,10 +25,8 @@ from comps.cores.proto.api_protocol import AudioTranscriptionResponse, RealtimeT
 logger = CustomLogger("whisper")
 logflag = os.getenv("LOGFLAG", False)
 
-# audio configuration constants
-SAMPLE_RATE = 16000  # Hz
-BYTES_PER_SAMPLE = 2  # 16-bit audio
-DEFAULT_CHUNK_DURATION_MS = 1000  # default chunk size is 1 second
+# audio configuration constantsgit 
+DEFAULT_CHUNK_DURATION_MS = 2500  # default chunk size is 2.5 seconds
 DEFAULT_FRAMES_PER_CHUNK = SAMPLE_RATE  # 16000 frames per second
 DEFAULT_DATA_TIMEOUT_MS = 1500  # set 1500ms for timeout
 
@@ -176,18 +174,18 @@ async def audio_transcriptions(
 
 @app.post("/v1/realtime/transcription_sessions")
 async def create_realtime_transcription_session(
-    input_audio_format: str = Form("pcm16"),
-    input_audio_noise_reduction: dict = Form(None),
-    input_audio_transcription: dict = Form("json"),
-    modalities: List = Form(None),
-    turn_detection: dict = Form(None),
-    include: str = Form(None)
+    input_audio_format: str = Body("pcm16"),
+    input_audio_noise_reduction: dict = Body(None),
+    input_audio_transcription: dict = Body("json"),
+    modalities: List = Body(None),
+    turn_detection: dict = Body(None),
+    include: str = Body(None)
 ):
     logger.info("Creating realtime transcription session.")
     curr_time = time.time()
     session_id = generate_session_id(curr_time)
-    expire_time = curr_time + 300  # set the expire time as 5 mins
-    if len(modalities) != 0:
+    expire_time = int(curr_time + 300)  # set the expire time as 5 mins later, now mimicing the OpenAI behavior
+    if modalities and len(modalities) != 0:
         if modalities[0] != "text":
             logger.info("Do not support modalities other than text for now.")
             modalities = "text"
@@ -195,9 +193,14 @@ async def create_realtime_transcription_session(
         modalities = ["text"]
 
     # Initialize configuration dictionary
+    if streaming_asr is None:
+        streaming_asr_ready.wait(timeout=15)
+    language = "en"
+    if hasattr(streaming_asr, "language"):
+        language = streaming_asr.language
     valid_config = {
-        "model": streaming_asr.model,
-        "language": streaming_asr.language,
+        "model": streaming_asr.model_size_or_path,
+        "language": language,
         "prompt": ""
     }
 
@@ -214,7 +217,7 @@ async def create_realtime_transcription_session(
             model = input_audio_transcription["model"]
             if model != valid_config["model"]:
                 logger.warning(
-                    f"Unmatched model: {model}. Now is using model {streaming_asr.model}")
+                    f"Unmatched model: {model}. Now is using model {streaming_asr.model_size_or_path}")
 
         # Handle language configuration
         if "language" in input_audio_transcription and valid_config["language"] != input_audio_transcription["language"]:
@@ -231,7 +234,7 @@ async def create_realtime_transcription_session(
     if include:
         logger.warning("Audio include setting is not supported at this time")
 
-    return RealtimeTranscriptionSession(session_id=session_id, expires_at=expire_time,
+    return RealtimeTranscriptionSession(id=session_id, expires_at=expire_time,
                                         input_audio_format=input_audio_format, input_audio_transcription=valid_config,
                                         modalities=modalities, turn_detection=None)
 
@@ -303,7 +306,7 @@ async def audio_transcriptions_streaming(websocket: WebSocket, intent: str = "tr
                     if len(audio_buffer) > 0:
                         logger.info(
                             f"Data receive timeout ({DEFAULT_DATA_TIMEOUT_MS}ms), processing final {len(audio_buffer)} bytes of audio data")
-                        await streaming_asr.audio2text_streaming(websocket=websocket, audio_data=bytes(audio_buffer), item_id=item_id+1, is_final=True)
+                        await streaming_asr.audio2text_streaming(websocket=websocket, audio_data=bytes(audio_buffer), item_id=item_id+1, event_id=event_id, is_final=True)
                     break
 
                 # process the audio data
@@ -321,8 +324,8 @@ async def audio_transcriptions_streaming(websocket: WebSocket, intent: str = "tr
                     audio_buffer.extend(audio_data)
 
                     # process complete chunks
-                    while len(audio_buffer) >= chunk_size:
-                        await streaming_asr.audio2text_streaming(websocket=websocket, audio_data=bytes(audio_buffer[:chunk_size]), item_id=item_id)
+                    if is_buffer_ready(audio_buffer, chunk_size):
+                        await streaming_asr.audio2text_streaming(websocket=websocket, audio_data=bytes(audio_buffer[:chunk_size]), item_id=item_id, event_id=event_id)
                         audio_buffer = audio_buffer[chunk_size:]
 
             except WebSocketDisconnect:
@@ -351,10 +354,11 @@ if __name__ == "__main__":
     parser.add_argument("--model_name_or_path", type=str,
                         default="openai/whisper-small")
     parser.add_argument("--streaming_model_name_or_path",
-                        type=str, default="openai/whisper-tiny")
+                        type=str, default="tiny")
     parser.add_argument("--language", type=str, default="english")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--return_timestamps", type=str, default=True)
+    parser.add_argument("--compute-type", type=str, default="int8")
 
     args = parser.parse_args()
     asr = WhisperModel(
