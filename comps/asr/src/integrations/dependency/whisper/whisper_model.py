@@ -40,7 +40,7 @@ class WhisperModel:
             "ASR_MODEL_PATH", model_name_or_path)
         print("Downloading model: {}".format(self.asr_model_name_or_path))
 
-        if device == "intel-gpu":
+        if device == "xpu":
             # intel gpu mode
             from ipex_llm.transformers import AutoModelForSpeechSeq2Seq
             from transformers import WhisperProcessor
@@ -249,17 +249,18 @@ class WhisperModel:
                 "audio", Audio(sampling_rate=SAMPLE_RATE))
             waveform = audio_dataset[0]["audio"]["array"]
 
-        if self.device == "intel-gpu":
+        if self.device == "xpu":
             forced_decoder_ids = self.processor.get_decoder_prompt_ids(
                 language=language, task="transcribe")
             with torch.inference_mode():
                 input_features = self.processor(
-                    waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt").input_features.to('xpu')
+                    waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt").input_features.to(self.device)
                 predicted_ids = self.model.generate(
                     input_features, forced_decoder_ids=forced_decoder_ids)
                 output_str = self.processor.batch_decode(
                     predicted_ids, skip_special_tokens=True)
                 # change the output format to be compatible with the OpenAI API
+                '''
                 if is_final:
                     response = {
                         "event_id": event_id,
@@ -270,14 +271,15 @@ class WhisperModel:
                     }
                     transcription = ""
                 else:
-                    response = {
-                        "type": "conversation.item.input_audio_transcription.delta",
-                        "event_id": event_id,
-                        "item_id": "item_" + f"{item_id:03}",
-                        "content_index": 0,
-                        "delta": output_str
-                    }
-                    transcription += output_str
+                '''
+                response = {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "event_id": event_id,
+                    "item_id": "item_" + f"{item_id:03}",
+                    "content_index": 0,
+                    "delta": output_str
+                }
+                transcription += output_str
 
                 # if the output is in Chinese, convert it to simplified Chinese
                 if self.language in ["chinese", "mandarin"]:
