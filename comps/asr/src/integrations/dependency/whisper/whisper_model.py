@@ -1,11 +1,13 @@
 # Copyright (C) 2024 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
+import io
 import os
 import time
 import uuid
 import urllib.request
 import wave
+import webrtcvad
 from fastapi import WebSocket, Form
 
 import numpy as np
@@ -230,6 +232,31 @@ class WhisperModel:
             return
 
         transcription = ""
+        vad = webrtcvad.Vad()
+        vad.set_mode(2) # set vad agressiveness mode
+
+        def detect_audio_segments(audio, sample_rate):
+            """detect speech segments using VAD"""
+            filtered_segments = []
+            default_chunk = int(sample_rate * 50 / 1000 * 2) # check VAD with 50ms chunk
+            start = 0
+            while (start + default_chunk < len(audio)):
+                audio_buffer = io.BytesIO(audio[start:start+default_chunk])
+                with wave.open(audio_buffer, 'rb') as wf:
+                    frames = wf.readframes(wf.getnframes())
+                try:
+                    if vad.is_speech(frames[start:start+default_chunk].tobytes(), sample_rate):
+                        filtered_segments.append(frames[start:start+default_chunk])
+                except Exception as e:
+                    print(f"Failed to perform VAD check with {e}")
+                    break
+                start += default_chunk
+            if vad.is_speech(frames[start: len(audio)-1].tobytes(), sample_rate):
+                filtered_segments.append(frames[start: len(audio)-1].tobytes())
+            return np.concatenate(filtered_segments)
+        
+        # remove silence using VAD
+        filtered_audio_data = detect_audio_segments(bytearray(audio_data), SAMPLE_RATE)
 
         # generate a temporary file name
         uid = str(uuid.uuid4())
@@ -241,7 +268,7 @@ class WhisperModel:
                 wav_file.setnchannels(1)  # single channel
                 wav_file.setsampwidth(BYTES_PER_SAMPLE)  # 16-bit
                 wav_file.setframerate(SAMPLE_RATE)
-                wav_file.writeframes(audio_data)
+                wav_file.writeframes(filtered_audio_data.tobytes())
         except Exception as e:
             print(f"[ASR] Failed to save audiosegment to file: {e}")
             return

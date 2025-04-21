@@ -26,7 +26,7 @@ logger = CustomLogger("whisper")
 logflag = os.getenv("LOGFLAG", False)
 
 # audio configuration constantsgit 
-DEFAULT_CHUNK_DURATION_MS = 2500  # default chunk size is 2.5 seconds
+DEFAULT_CHUNK_DURATION_MS = 3000  # default chunk size is 2.5 seconds
 DEFAULT_FRAMES_PER_CHUNK = SAMPLE_RATE  # 16000 frames per second
 DEFAULT_DATA_TIMEOUT_MS = 1500  # set 1500ms for timeout
 
