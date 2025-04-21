@@ -238,97 +238,118 @@ class WhisperModel:
         def detect_audio_segments(audio, sample_rate):
             """detect speech segments using VAD"""
             filtered_segments = []
-            default_chunk = int(sample_rate * 50 / 1000 * 2) # check VAD with 50ms chunk
+            default_chunk = int(sample_rate * 30 / 1000 * 2) # check VAD with 30ms chunk
             start = 0
-            while (start + default_chunk < len(audio)):
-                audio_buffer = io.BytesIO(audio[start:start+default_chunk])
-                with wave.open(audio_buffer, 'rb') as wf:
-                    frames = wf.readframes(wf.getnframes())
+            while (start + default_chunk <= len(audio)):
+                frame = audio[start:start+default_chunk]
                 try:
-                    if vad.is_speech(frames[start:start+default_chunk].tobytes(), sample_rate):
-                        filtered_segments.append(frames[start:start+default_chunk])
+                    if vad.is_speech(frame, sample_rate):
+                        filtered_segments.append(frame)
                 except Exception as e:
-                    print(f"Failed to perform VAD check with {e}")
+                    print(f"[ASR] Failed to perform VAD check with {e}")
                     break
                 start += default_chunk
-            if vad.is_speech(frames[start: len(audio)-1].tobytes(), sample_rate):
-                filtered_segments.append(frames[start: len(audio)-1].tobytes())
-            return np.concatenate(filtered_segments)
+            
+            if start < len(audio):
+                padding = b'\x00' * (default_chunk - len(audio) + start + 1)
+                frame = audio[start:len(audio)-1] + padding
+                try:
+                    if vad.is_speech(frame, sample_rate):
+                        filtered_segments.append(frame)
+                except Exception as e:
+                    print(f"[ASR] Failed to perform VAD check the remaining frame with {e}")
+
+            # concatenate all speech segments
+            if filtered_segments:
+                return b''.join(filtered_segments)
+            else:
+                return None
         
-        # remove silence using VAD
-        filtered_audio_data = detect_audio_segments(bytearray(audio_data), SAMPLE_RATE)
-
-        # generate a temporary file name
-        uid = str(uuid.uuid4())
-        temp_filename = f"{uid}.wav"
-
-        try:
-            # create a WAV file
-            with wave.open(temp_filename, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # single channel
-                wav_file.setsampwidth(BYTES_PER_SAMPLE)  # 16-bit
-                wav_file.setframerate(SAMPLE_RATE)
-                wav_file.writeframes(filtered_audio_data.tobytes())
-        except Exception as e:
-            print(f"[ASR] Failed to save audiosegment to file: {e}")
-            return
-
-        ds = Dataset.from_dict({"audio": [temp_filename]}).cast_column("audio", Audio())
-
-        if self.device == "xpu":
-            with torch.inference_mode():
-                sample = ds[0]["audio"]
-
-                inputs = self.processor(sample["array"],
-                                   sampling_rate=sample["sampling_rate"],
-                                   return_attention_mask=True,
-                                   return_tensors="pt")
-                input_features = inputs.input_features.to('xpu')
-                attention_mask = inputs.attention_mask.to('xpu')
-                forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task="transcribe")
-                predicted_ids = self.model.generate(input_features,
-                                               forced_decoder_ids=forced_decoder_ids,
-                                               attention_mask=attention_mask)
-                output_str = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
-
-                # change the output format to be compatible with the OpenAI API
-                '''
-                if is_final:
-                    response = {
-                        "event_id": event_id,
-                        "type": "conversation.item.input_audio_transcription.completed",
-                        "item_id": "item_" + f"{item_id:03}",
-                        "content_index": 0,
-                        "transcript": transcription + output_str
-                    }
-                    transcription = ""
-                else:
-                '''
-                response = {
-                    "type": "conversation.item.input_audio_transcription.delta",
+        # skip silence using VAD
+        filtered_audio_data = detect_audio_segments(audio_data, SAMPLE_RATE)
+        if filtered_audio_data is None:
+            print(f"[ASR] Skip empty audio data.")
+            await websocket.send_json({
+                "type": "conversation.item.input_audio_transcription.delta",
                     "event_id": event_id,
                     "item_id": "item_" + f"{item_id:03}",
                     "content_index": 0,
-                    "delta": output_str
-                }
-                # combine delta together
-                # transcription += output_str
+                    "delta": ""
+            })
+        else :
+            # generate a temporary file name
+            uid = str(uuid.uuid4())
+            temp_filename = f"{uid}.wav"
 
-                # if the output is in Chinese, convert it to simplified Chinese
-                if self.language in ["chinese", "mandarin"]:
-                    from zhconv import convert
-                    if "delta" in response:
-                        response["delta"] = convert(response["delta"], "zh-cn")
+            try:
+                # create a WAV file
+                with wave.open(temp_filename, 'wb') as wav_file:
+                    wav_file.setnchannels(1)  # single channel
+                    wav_file.setsampwidth(BYTES_PER_SAMPLE)  # 16-bit
+                    wav_file.setframerate(SAMPLE_RATE)
+                    wav_file.writeframes(filtered_audio_data)
+            except Exception as e:
+                print(f"[ASR] Failed to save audiosegment to file: {e}")
+                return
+
+            ds = Dataset.from_dict({"audio": [temp_filename]}).cast_column("audio", Audio())
+
+            if self.device == "xpu" and filtered_audio_data is not None:
+                with torch.inference_mode():
+                    sample = ds[0]["audio"]
+
+                    inputs = self.processor(sample["array"],
+                                       sampling_rate=sample["sampling_rate"],
+                                       return_attention_mask=True,
+                                       return_tensors="pt")
+                    input_features = inputs.input_features.to('xpu')
+                    attention_mask = inputs.attention_mask.to('xpu')
+                    forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task="transcribe")
+                    predicted_ids = self.model.generate(input_features,
+                                                   forced_decoder_ids=forced_decoder_ids,
+                                                   attention_mask=attention_mask)
+                    output_str = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
+
+                    # change the output format to be compatible with the OpenAI API
+                    '''
+                    if is_final:
+                        response = {
+                            "event_id": event_id,
+                            "type": "conversation.item.input_audio_transcription.completed",
+                            "item_id": "item_" + f"{item_id:03}",
+                            "content_index": 0,
+                            "transcript": transcription + output_str
+                        }
+                        transcription = ""
                     else:
-                        response["transcript"] = convert(
-                            response["transcript"], "zh-cn")
+                    '''
+                    response = {
+                        "type": "conversation.item.input_audio_transcription.delta",
+                        "event_id": event_id,
+                        "item_id": "item_" + f"{item_id:03}",
+                        "content_index": 0,
+                        "delta": output_str
+                    }
+                    # combine delta together
+                    # transcription += output_str
 
-                # send the response through websocket
-                await websocket.send_json(response)
+                    # if the output is in Chinese, convert it to simplified Chinese
+                    if self.language in ["chinese", "mandarin"]:
+                        from zhconv import convert
+                        if "delta" in response:
+                            response["delta"] = convert(response["delta"], "zh-cn")
+                        '''
+                        else:
+                            response["transcript"] = convert(
+                                response["transcript"], "zh-cn")
+                        '''
 
-        else:
-            raise ValueError(f"Unsupported device: {self.device}")
-        os.remove(temp_filename)
+                    # send the response through websocket
+                    await websocket.send_json(response)
+
+            else:
+                raise ValueError(f"Unsupported device: {self.device}")
+            os.remove(temp_filename)
 
 
 if __name__ == "__main__":

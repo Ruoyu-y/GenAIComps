@@ -306,7 +306,7 @@ async def audio_transcriptions_streaming(websocket: WebSocket, intent: str = "tr
                     if len(audio_buffer) > 0:
                         logger.info(
                             f"Data receive timeout ({DEFAULT_DATA_TIMEOUT_MS}ms), processing final {len(audio_buffer)} bytes of audio data")
-                        await streaming_asr.audio2text_streaming(websocket=websocket, audio_data=bytes(audio_buffer), item_id=item_id+1, event_id=event_id, is_final=True)
+                        await streaming_asr.audio2text_streaming(websocket=websocket, audio_data=bytes(audio_buffer), item_id=item_id, event_id=event_id, is_final=True)
                     break
 
                 # process the audio data
@@ -315,6 +315,7 @@ async def audio_transcriptions_streaming(websocket: WebSocket, intent: str = "tr
                     event_id = message.get("event_id")
                     if event_id in idx_list:
                         item_id = idx_list[event_id] + 1
+                        idx_list[event_id] = item_id
                     else:
                         idx_list[event_id] = 0
                         item_id = 0
