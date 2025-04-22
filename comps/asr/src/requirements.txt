@@ -1,9 +1,10 @@
-accelerate
+accelerate>=0.26.0
 aiohttp
 datasets
 docarray[full]
 fastapi
 faster-whisper
+librosa
 opentelemetry-api
 opentelemetry-exporter-otlp
 opentelemetry-sdk
@@ -12,7 +13,9 @@ pydantic==2.7.2
 pydub
 python-multipart
 shortuuid
+soundfile
 transformers
+trl==0.11.0
 uvicorn
 webrtcvad
 zhconv
