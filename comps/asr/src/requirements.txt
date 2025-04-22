@@ -3,6 +3,7 @@ aiohttp
 datasets
 docarray[full]
 fastapi
+faster-whisper
 opentelemetry-api
 opentelemetry-exporter-otlp
 opentelemetry-sdk
@@ -13,4 +14,5 @@ python-multipart
 shortuuid
 transformers
 uvicorn
+webrtcvad
 zhconv

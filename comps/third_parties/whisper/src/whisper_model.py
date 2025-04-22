@@ -3,13 +3,17 @@
 
 import os
 import time
-import urllib.request
-
-import numpy as np
 import torch
-from datasets import Audio, Dataset
-from pydub import AudioSegment
+import urllib.request
+import uuid
+import wave
+import webrtcvad
 
+from datasets import Audio, Dataset
+from fastapi import WebSocket
+import numpy as np
+from pydub import AudioSegment
+from faster_whisper_model import SAMPLE_RATE, BYTES_PER_SAMPLE
 
 class WhisperModel:
     """Convert audio to text."""
@@ -32,9 +36,23 @@ class WhisperModel:
         self.device = device
         self.asr_model_name_or_path = os.environ.get("ASR_MODEL_PATH", model_name_or_path)
         print("Downloading model: {}".format(self.asr_model_name_or_path))
-        self.model = WhisperForConditionalGeneration.from_pretrained(self.asr_model_name_or_path).to(self.device)
-        self.processor = WhisperProcessor.from_pretrained(self.asr_model_name_or_path)
-        self.model.eval()
+        if device == "xpu":
+            from ipex_llm.transformers import AutoModelForSpeechSeq2Seq
+            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_name_or_path,
+                load_in_4bit=True,
+                optimize_model=False,
+                use_cache=True
+            )
+            self.model.to(self.device)
+            self.model.forced_decoder_ids = None
+            self.processor = WhisperProcessor.from_pretrained(
+                model_name_or_path)
+            print("Whisper initialized on Intel XPU.")
+        else:
+            self.model = WhisperForConditionalGeneration.from_pretrained(self.asr_model_name_or_path).to(self.device)
+            self.processor = WhisperProcessor.from_pretrained(self.asr_model_name_or_path)
+            self.model.eval()
 
         self.language = language
         self.hpu_max_len = hpu_max_len
@@ -185,6 +203,136 @@ class WhisperModel:
         print(f"generated text in {time.time() - start} seconds, and the result is: {result}")
         return result
 
+    async def audio2text_streaming(self,
+                                   websocket: WebSocket,
+                                   audio_data: bytes,
+                                   event_id: str,
+                                   item_id: int,
+                                   language: str = "en",
+                                   is_final: bool = False):
+        """Convert streaming audio to text"""
+        if not audio_data:
+            return
+
+        transcription = ""
+        vad = webrtcvad.Vad()
+        vad.set_mode(2) # set vad agressiveness mode
+
+        def detect_audio_segments(audio, sample_rate):
+            """detect speech segments using VAD"""
+            filtered_segments = []
+            default_chunk = int(sample_rate * 30 / 1000 * 2) # check VAD with 30ms chunk
+            start = 0
+            while (start + default_chunk <= len(audio)):
+                frame = audio[start:start+default_chunk]
+                try:
+                    if vad.is_speech(frame, sample_rate):
+                        filtered_segments.append(frame)
+                except Exception as e:
+                    print(f"[ASR] Failed to perform VAD check with {e}")
+                    break
+                start += default_chunk
+
+            if start < len(audio):
+                padding = b'\x00' * (default_chunk - len(audio) + start + 1)
+                frame = audio[start:len(audio)-1] + padding
+                try:
+                    if vad.is_speech(frame, sample_rate):
+                        filtered_segments.append(frame)
+                except Exception as e:
+                    print(f"[ASR] Failed to perform VAD check the remaining frame with {e}")
+
+            # concatenate all speech segments
+            if filtered_segments:
+                return b''.join(filtered_segments)
+            else:
+                return None
+
+        # skip silence using VAD
+        filtered_audio_data = detect_audio_segments(audio_data, SAMPLE_RATE)
+        if filtered_audio_data is None:
+            print(f"[ASR] Skip empty audio data.")
+            await websocket.send_json({
+                "type": "conversation.item.input_audio_transcription.delta",
+                    "event_id": event_id,
+                    "item_id": "item_" + f"{item_id:03}",
+                    "content_index": 0,
+                    "delta": ""
+            })
+        else :
+            # generate a temporary file name
+            uid = str(uuid.uuid4())
+            temp_filename = f"{uid}.wav"
+
+            try:
+                # create a WAV file
+                with wave.open(temp_filename, 'wb') as wav_file:
+                    wav_file.setnchannels(1)  # single channel, mono audio
+                    wav_file.setsampwidth(BYTES_PER_SAMPLE)  # 16-bit
+                    wav_file.setframerate(SAMPLE_RATE)
+                    wav_file.writeframes(filtered_audio_data)
+            except Exception as e:
+                print(f"[ASR] Failed to save audiosegment to file: {e}")
+                return
+
+            ds = Dataset.from_dict({"audio": [temp_filename]}).cast_column("audio", Audio(sampling_rate=16000))
+
+            if self.device == "xpu" and filtered_audio_data is not None:
+                with torch.inference_mode():
+                    sample = ds[0]["audio"]
+
+                    inputs = self.processor(sample["array"],
+                                       sampling_rate=sample["sampling_rate"],
+                                       return_attention_mask=True,
+                                       return_tensors="pt")
+                    input_features = inputs.input_features.to('xpu')
+                    attention_mask = inputs.attention_mask.to('xpu')
+                    forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task="transcribe")
+                    predicted_ids = self.model.generate(input_features,
+                                                   forced_decoder_ids=forced_decoder_ids,
+                                                   attention_mask=attention_mask)
+                    output_str = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)
+
+                    # change the output format to be compatible with the OpenAI API
+                    '''
+                    if is_final:
+                        response = {
+                            "event_id": event_id,
+                            "type": "conversation.item.input_audio_transcription.completed",
+                            "item_id": "item_" + f"{item_id:03}",
+                            "content_index": 0,
+                            "transcript": transcription + output_str
+                        }
+                        transcription = ""
+                    else:
+                    '''
+                    response = {
+                        "type": "conversation.item.input_audio_transcription.delta",
+                        "event_id": event_id,
+                        "item_id": "item_" + f"{item_id:03}",
+                        "content_index": 0,
+                        "delta": output_str
+                    }
+                    # combine delta together
+                    # transcription += output_str
+
+                    # if the output is in Chinese, convert it to simplified Chinese
+                    if self.language in ["chinese", "mandarin"]:
+                        from zhconv import convert
+                        if "delta" in response:
+                            response["delta"] = convert(response["delta"], "zh-cn")
+                        '''
+                        else:
+                            response["transcript"] = convert(
+                                response["transcript"], "zh-cn")
+                        '''
+
+                    # send the response through websocket
+                    await websocket.send_json(response)
+
+            else:
+                raise ValueError(f"Unsupported device: {self.device}")
+            os.remove(temp_filename)
 
 if __name__ == "__main__":
     asr = WhisperModel(
