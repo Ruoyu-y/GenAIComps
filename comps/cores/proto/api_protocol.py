@@ -1013,3 +1013,39 @@ class FineTuningJobCheckpoint(BaseModel):
 
     step_number: Optional[int] = None
     """The step number that the checkpoint was created at."""
+
+class RealtimeTranscriptionSession(BaseModel):
+    id: str
+    object: str = "realtime_transcription_session"
+    client_secret: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Ephemeral key returned by the API. Only present when the session is created on the server via REST API."
+    )
+    expires_at: Optional[int] = Field(
+        description="Timestamp for when the token expires. Currently, all tokens expire after one minute."
+    )
+    input_audio_format: Optional[str] = Field(
+        description="The format of input audio. Option is pcm16.",
+        default="pcm16"
+    )
+    input_audio_transcription: Optional[Dict[str, Any]] = Field(
+        description="Configuration of the transcription model.",
+        default={
+            "language": "en",
+            "model": "tiny",
+            "prompt": None
+        }
+    )
+    modalities: Optional[List[str]] = Field(
+        default=["text"],
+        description="The set of modalities the model can respond with."
+    )
+    turn_detection: Optional[Dict[str, Any]] = Field(
+        default={
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 500,
+            "threshold": 0.5,
+            "type": "server_vad"
+        },
+        description="Configuration for turn detection. Can be set to null to turn off."
+    )
